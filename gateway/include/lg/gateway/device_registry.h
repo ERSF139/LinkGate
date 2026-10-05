@@ -10,7 +10,7 @@
 
 namespace lg::gateway {
 
-// 设备 ID 到当前连接的映射，跨 IO 线程共享，用一把锁保护（见 decisions.md D-002）。
+// 设备 ID 到当前连接的映射，跨 IO 线程共享，用一把锁保护（见 decisions.md D-002、D-009）。
 // 同一个 ID 只能有一条连接：新连接上线时顶掉旧连接（典型场景是设备重启后旧连接还没被发现断开）。
 class DeviceRegistry {
 public:

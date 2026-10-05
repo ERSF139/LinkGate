@@ -57,7 +57,7 @@ void BM_ParseSampleStream(benchmark::State& state) {
         benchmark::DoNotOptimize(frames);
     }
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * 1000);
-    state.SetBytesProcessed(static_cast<std::int64_t>(state.iterations() * stream.size()));
+    state.SetBytesProcessed(state.iterations() * static_cast<std::int64_t>(stream.size()));
 }
 BENCHMARK(BM_ParseSampleStream);
 

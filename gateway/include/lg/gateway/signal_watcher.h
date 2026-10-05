@@ -14,7 +14,7 @@ class EventLoop;
 namespace lg::gateway {
 
 // 用 signalfd 把信号变成事件循环里的一个可读事件，回调在 loop 线程里执行，
-// 不受异步信号安全的限制（见 decisions.md D-006）。
+// 不受异步信号安全的限制（见 decisions.md D-008）。
 // 必须在启动任何其他线程之前构造：它屏蔽当前线程的这些信号，之后创建的线程继承这个屏蔽字，
 // 否则信号可能被投递给某个 IO 线程，绕过 signalfd。
 class SignalWatcher {
