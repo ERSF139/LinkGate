@@ -1,0 +1,415 @@
+From 45575883b50597ca5becef9e329e31c8582baa61 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E6=9D=8E=E6=B3=BD=E4=BC=A6?= <1647909201@qq.com>
+Date: Mon, 5 Oct 2026 15:02:57 +0000
+Subject: [PATCH 2/2] feat(simulator): add LinkGate gateway mode
+
+Each simulated device opens its own TCP connection to the gateway's device
+port, sends a heartbeat every second and reconnects with exponential backoff.
+The existing listen mode is unchanged.
+---
+ simulator/CMakeLists.txt      |   2 +
+ simulator/gatewayuplink.cpp   | 149 ++++++++++++++++++++++++++++++++++
+ simulator/gatewayuplink.h     |  57 +++++++++++++
+ simulator/simulatorwindow.cpp |  57 ++++++++++++-
+ simulator/simulatorwindow.h   |  10 +++
+ 5 files changed, 273 insertions(+), 2 deletions(-)
+ create mode 100644 simulator/gatewayuplink.cpp
+ create mode 100644 simulator/gatewayuplink.h
+
+diff --git a/simulator/CMakeLists.txt b/simulator/CMakeLists.txt
+index 30ef8b8..a67d931 100644
+--- a/simulator/CMakeLists.txt
++++ b/simulator/CMakeLists.txt
+@@ -5,6 +5,8 @@ qt_add_executable(simulator
+     device.cpp
+     deviceserver.h
+     deviceserver.cpp
++    gatewayuplink.h
++    gatewayuplink.cpp
+     simulatorwindow.h
+     simulatorwindow.cpp
+ )
+diff --git a/simulator/gatewayuplink.cpp b/simulator/gatewayuplink.cpp
+new file mode 100644
+index 0000000..964b5e9
+--- /dev/null
++++ b/simulator/gatewayuplink.cpp
+@@ -0,0 +1,149 @@
++#include "gatewayuplink.h"
++
++#include "protocol.h"
++#include "reconnect.h"
++
++#include <QTcpSocket>
++#include <QTimer>
++
++#include <utility>
++
++namespace {
++
++// 网关处理不过来时，不让模拟器自己的发送缓冲无限增长：积压超过这个量就丢弃新采样。
++constexpr qint64 kMaxPendingBytes = 256 * 1024;
++
++} // namespace
++
++GatewayUplink::GatewayUplink(QObject* parent)
++    : QObject(parent)
++    , m_heartbeatTimer(new QTimer(this))
++{
++    m_heartbeatTimer->setInterval(Reconnect::kHeartbeatIntervalMs);
++    connect(m_heartbeatTimer, &QTimer::timeout, this, &GatewayUplink::sendHeartbeats);
++}
++
++GatewayUplink::~GatewayUplink()
++{
++    stop();
++}
++
++bool GatewayUplink::isActive() const
++{
++    return m_active;
++}
++
++int GatewayUplink::connectedCount() const
++{
++    return m_connected;
++}
++
++void GatewayUplink::start(const QString& host, quint16 port, const QList<int>& deviceIds)
++{
++    stop();
++    m_host   = host;
++    m_port   = port;
++    m_active = true;
++
++    for (const int deviceId : deviceIds) {
++        Link link;
++        link.socket         = new QTcpSocket(this);
++        link.reconnectTimer = new QTimer(this);
++        link.reconnectTimer->setSingleShot(true);
++        link.backoffMs      = Reconnect::kInitialDelayMs;
++        m_links.insert(deviceId, link);
++
++        connect(link.socket, &QTcpSocket::connected, this, [this, deviceId]() {
++            m_links[deviceId].backoffMs = Reconnect::kInitialDelayMs;
++            updateConnectedCount();
++        });
++        connect(link.socket, &QTcpSocket::disconnected, this, [this, deviceId]() {
++            updateConnectedCount();
++            scheduleReconnect(deviceId);
++        });
++        connect(link.socket, &QTcpSocket::errorOccurred, this, [this, deviceId](QAbstractSocket::SocketError) {
++            const QTcpSocket* s = m_links.value(deviceId).socket;
++            if (s != nullptr && s->state() == QAbstractSocket::UnconnectedState)
++                scheduleReconnect(deviceId);
++        });
++        connect(link.reconnectTimer, &QTimer::timeout, this, [this, deviceId]() { connectLink(deviceId); });
++
++        connectLink(deviceId);
++    }
++
++    m_heartbeatTimer->start();
++    emit logMessage(QString("网关模式：%1 台设备正在连接 %2:%3").arg(deviceIds.size()).arg(host).arg(port));
++}
++
++void GatewayUplink::stop()
++{
++    if (!m_active)
++        return;
++    m_active = false;
++    m_heartbeatTimer->stop();
++
++    for (auto it = m_links.begin(); it != m_links.end(); ++it) {
++        it->reconnectTimer->stop();
++        it->socket->abort();
++        it->socket->deleteLater();
++        it->reconnectTimer->deleteLater();
++    }
++    m_links.clear();
++    updateConnectedCount();
++    emit logMessage("已断开网关");
++}
++
++void GatewayUplink::sendSample(const Sample& sample)
++{
++    const auto it = m_links.constFind(sample.deviceId);
++    if (it == m_links.constEnd())
++        return;
++
++    QTcpSocket* socket = it->socket;
++    if (socket->state() != QAbstractSocket::ConnectedState || socket->bytesToWrite() > kMaxPendingBytes)
++        return;
++
++    socket->write(Protocol::buildFrame(Protocol::MessageType::Sample, Protocol::encodeSample(sample)));
++}
++
++void GatewayUplink::connectLink(int deviceId)
++{
++    if (!m_active)
++        return;
++    QTcpSocket* socket = m_links.value(deviceId).socket;
++    if (socket != nullptr && socket->state() == QAbstractSocket::UnconnectedState)
++        socket->connectToHost(m_host, m_port);
++}
++
++void GatewayUplink::scheduleReconnect(int deviceId)
++{
++    if (!m_active || !m_links.contains(deviceId))
++        return;
++    Link& link = m_links[deviceId];
++    if (link.reconnectTimer->isActive())
++        return;
++    link.reconnectTimer->start(link.backoffMs);
++    link.backoffMs = Reconnect::nextDelayMs(link.backoffMs);
++}
++
++void GatewayUplink::sendHeartbeats()
++{
++    const QByteArray frame = Protocol::buildFrame(Protocol::MessageType::Heartbeat, QByteArray());
++    for (const Link& link : std::as_const(m_links)) {
++        if (link.socket->state() == QAbstractSocket::ConnectedState)
++            link.socket->write(frame);
++    }
++}
++
++void GatewayUplink::updateConnectedCount()
++{
++    int connected = 0;
++    for (const Link& link : std::as_const(m_links)) {
++        if (link.socket->state() == QAbstractSocket::ConnectedState)
++            ++connected;
++    }
++    if (connected != m_connected) {
++        m_connected = connected;
++        emit connectedCountChanged(connected);
++    }
++}
+diff --git a/simulator/gatewayuplink.h b/simulator/gatewayuplink.h
+new file mode 100644
+index 0000000..158cd9a
+--- /dev/null
++++ b/simulator/gatewayuplink.h
+@@ -0,0 +1,57 @@
++#ifndef GATEWAYUPLINK_H
++#define GATEWAYUPLINK_H
++
++#include "sample.h"
++
++#include <QHash>
++#include <QList>
++#include <QObject>
++#include <QString>
++
++class QTcpSocket;
++class QTimer;
++
++// 网关模式：每台设备一条连接，主动连到 LinkGate 的设备端口（默认 9100），
++// 每秒发一次心跳，断线后按指数退避重连。与 DeviceServer 的"监听、等客户端来连"互为两种拓扑。
++class GatewayUplink : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit GatewayUplink(QObject* parent = nullptr);
++    ~GatewayUplink() override;
++
++    bool isActive() const;
++    int  connectedCount() const;
++
++public slots:
++    void start(const QString& host, quint16 port, const QList<int>& deviceIds);
++    void stop();
++    void sendSample(const Sample& sample);
++
++signals:
++    void connectedCountChanged(int count);
++    void logMessage(const QString& text);
++
++private:
++    struct Link
++    {
++        QTcpSocket* socket         = nullptr;
++        QTimer*     reconnectTimer = nullptr;
++        int         backoffMs      = 0;
++    };
++
++    void connectLink(int deviceId);
++    void scheduleReconnect(int deviceId);
++    void sendHeartbeats();
++    void updateConnectedCount();
++
++    QHash<int, Link> m_links;
++    QTimer*          m_heartbeatTimer;
++    QString          m_host;
++    quint16          m_port      = 0;
++    bool             m_active    = false;
++    int              m_connected = 0;
++};
++
++#endif // GATEWAYUPLINK_H
+diff --git a/simulator/simulatorwindow.cpp b/simulator/simulatorwindow.cpp
+index a46d292..86b04fe 100644
+--- a/simulator/simulatorwindow.cpp
++++ b/simulator/simulatorwindow.cpp
+@@ -2,12 +2,15 @@
+ 
+ #include "device.h"
+ #include "deviceserver.h"
++#include "gatewayuplink.h"
+ 
+ #include <algorithm>
++#include <utility>
+ #include <QDateTime>
+ #include <QFormLayout>
+ #include <QGroupBox>
+ #include <QLabel>
++#include <QLineEdit>
+ #include <QPlainTextEdit>
+ #include <QPushButton>
+ #include <QSpinBox>
+@@ -24,9 +27,10 @@ constexpr int kDeviceCount = 5;
+ SimulatorWindow::SimulatorWindow(QWidget* parent)
+     : QWidget(parent)
+     , m_server(new DeviceServer(this))
++    , m_uplink(new GatewayUplink(this))
+ {
+     setWindowTitle("DeviceLink 设备模拟器");
+-    resize(760, 720);
++    resize(760, 820);
+ 
+     buildUi();
+     createDevices();
+@@ -35,6 +39,13 @@ SimulatorWindow::SimulatorWindow(QWidget* parent)
+             this, &SimulatorWindow::appendLog);
+     connect(m_server, &DeviceServer::clientCountChanged,
+             this, &SimulatorWindow::onClientCountChanged);
++    connect(m_uplink, &GatewayUplink::logMessage,
++            this, &SimulatorWindow::appendLog);
++    connect(m_uplink, &GatewayUplink::connectedCountChanged, this, [this](int count) {
++        m_gatewayStatusLabel->setText(QString("%1 / %2").arg(count).arg(m_devices.size()));
++    });
++    connect(m_gatewayButton, &QPushButton::clicked,
++            this, &SimulatorWindow::onGatewayClicked);
+ 
+     connect(m_toggleAllButton, &QPushButton::clicked,
+             this, &SimulatorWindow::onToggleAllClicked);
+@@ -101,9 +112,25 @@ void SimulatorWindow::buildUi()
+     serverForm->addRow("已连接客户端：", m_clientCountLabel);
+     serverForm->addRow(m_listenButton);
+ 
+-    auto* serverGroup = new QGroupBox("网络服务", this);
++    auto* serverGroup = new QGroupBox("网络服务（直连模式：客户端连到模拟器）", this);
+     serverGroup->setLayout(serverForm);
+ 
++    m_gatewayHostEdit = new QLineEdit("127.0.0.1", this);
++    m_gatewayPortSpinBox = new QSpinBox(this);
++    m_gatewayPortSpinBox->setRange(1024, 65535);
++    m_gatewayPortSpinBox->setValue(9100);
++    m_gatewayStatusLabel = new QLabel("未连接", this);
++    m_gatewayButton      = new QPushButton("连接网关", this);
++
++    auto* gatewayForm = new QFormLayout;
++    gatewayForm->addRow("网关地址：",       m_gatewayHostEdit);
++    gatewayForm->addRow("设备端口：",       m_gatewayPortSpinBox);
++    gatewayForm->addRow("已连上的设备：",   m_gatewayStatusLabel);
++    gatewayForm->addRow(m_gatewayButton);
++
++    auto* gatewayGroup = new QGroupBox("LinkGate 网关（网关模式：每台设备一条连接连到网关）", this);
++    gatewayGroup->setLayout(gatewayForm);
++
+     m_logEdit = new QPlainTextEdit(this);
+     m_logEdit->setReadOnly(true);
+     m_logEdit->setMaximumBlockCount(500);
+@@ -111,6 +138,7 @@ void SimulatorWindow::buildUi()
+     auto* layout = new QVBoxLayout(this);
+     layout->addWidget(deviceGroup);
+     layout->addWidget(serverGroup);
++    layout->addWidget(gatewayGroup);
+     layout->addWidget(m_logEdit, 1);
+ }
+ 
+@@ -125,6 +153,8 @@ void SimulatorWindow::createDevices()
+                 this, &SimulatorWindow::onSampleGenerated);
+         connect(device, &Device::sampleGenerated,
+                 m_server, &DeviceServer::broadcastSample);
++        connect(device, &Device::sampleGenerated,
++                m_uplink, &GatewayUplink::sendSample);
+         m_deviceTable->item(i, 0)->setText(device->name());
+         refreshStatusCell(i);
+     }
+@@ -211,6 +241,29 @@ void SimulatorWindow::onListenClicked()
+     }
+ }
+ 
++void SimulatorWindow::onGatewayClicked()
++{
++    if (m_uplink->isActive()) {
++        m_uplink->stop();
++        m_gatewayHostEdit->setEnabled(true);
++        m_gatewayPortSpinBox->setEnabled(true);
++        m_gatewayButton->setText("连接网关");
++        m_gatewayStatusLabel->setText("未连接");
++        return;
++    }
++
++    QList<int> ids;
++    for (const Device* device : std::as_const(m_devices))
++        ids.append(device->id());
++
++    m_uplink->start(m_gatewayHostEdit->text().trimmed(),
++                    static_cast<quint16>(m_gatewayPortSpinBox->value()), ids);
++    m_gatewayHostEdit->setEnabled(false);
++    m_gatewayPortSpinBox->setEnabled(false);
++    m_gatewayButton->setText("断开网关");
++    m_gatewayStatusLabel->setText(QString("0 / %1").arg(ids.size()));
++}
++
+ void SimulatorWindow::onClientCountChanged(int count)
+ {
+     m_clientCountLabel->setText(QString::number(count));
+diff --git a/simulator/simulatorwindow.h b/simulator/simulatorwindow.h
+index 7475170..9a861a3 100644
+--- a/simulator/simulatorwindow.h
++++ b/simulator/simulatorwindow.h
+@@ -7,7 +7,9 @@
+ #include <QWidget>
+ 
+ class Device;
++class GatewayUplink;
+ class QLabel;
++class QLineEdit;
+ class QPushButton;
+ class DeviceServer;
+ class QPlainTextEdit;
+@@ -31,6 +33,7 @@ private:
+     void onInjectSpikeClicked();
+     void onResetValuesClicked();
+     void onListenClicked();
++    void onGatewayClicked();
+     void onClientCountChanged(int count);
+     void appendLog(const QString& text);
+ 
+@@ -40,6 +43,7 @@ private:
+ 
+     QList<Device*> m_devices;
+     DeviceServer* m_server;
++    GatewayUplink* m_uplink;
+ 
+     QTableWidget* m_deviceTable;
+     QPushButton*  m_toggleAllButton;
+@@ -50,6 +54,12 @@ private:
+     QSpinBox*       m_portSpinBox;
+     QPushButton*    m_listenButton;
+     QLabel*         m_clientCountLabel;
++
++    QLineEdit*      m_gatewayHostEdit;
++    QSpinBox*       m_gatewayPortSpinBox;
++    QPushButton*    m_gatewayButton;
++    QLabel*         m_gatewayStatusLabel;
++
+     QPlainTextEdit* m_logEdit;
+ };
+ 
+-- 
+2.43.0
+
