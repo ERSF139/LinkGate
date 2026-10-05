@@ -1,0 +1,12 @@
+set(LG_SANITIZER "" CACHE STRING "Sanitizer to enable: empty, address, or thread")
+set_property(CACHE LG_SANITIZER PROPERTY STRINGS "" address thread)
+
+if(LG_SANITIZER STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+  add_link_options(-fsanitize=address,undefined)
+elseif(LG_SANITIZER STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+elseif(NOT LG_SANITIZER STREQUAL "")
+  message(FATAL_ERROR "Unknown LG_SANITIZER: '${LG_SANITIZER}' (expected empty, address or thread)")
+endif()

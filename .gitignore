@@ -1,0 +1,8 @@
+build*/
+.vscode/
+.cache/
+CMakeUserPresets.json
+fuzz/corpus/
+crash-*
+leak-*
+timeout-*
