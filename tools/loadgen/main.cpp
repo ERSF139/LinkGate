@@ -398,7 +398,7 @@ int main(int argc, char** argv) {
 
     std::cout << "\n=== LinkGate loadgen report ===\n"
               << "devices: " << connected << "/" << options.devices << " connected, rate " << options.rate
-              << " Hz each, " << pool->loops().size() << " IO thread(s)\n"
+              << " Hz each, " << pool->loops().size() << " loadgen thread(s)\n"
               << "samples sent: " << sent << " in " << elapsed << " s total\n";
     for (std::size_t i = 0; i < subscribers.size(); ++i) {
         Subscriber* s = subscribers[i].get();
